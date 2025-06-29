@@ -1,0 +1,290 @@
+#include <WiFi.h>
+#include <WebSocketsServer.h>
+#include <ArduinoJson.h>
+
+// L298N Motor Control Pins
+const int ENA = 26;    // PWM pin for Motor A speed
+const int IN1 = 25;    // Direction control pin 1
+const int IN2 = 33;    // Direction control pin 2
+const int IN3 = 27;    // Direction control pin 3
+const int IN4 = 14;    // Direction control pin 4
+const int ENB = 12;    // PWM pin for Motor B speed
+
+// Robot Physical Parameters
+const float WHEEL_RADIUS = 6.5;        // Radius of wheels in cm
+const float WHEEL_DISTANCE = 15.5;     // Distance between wheels in cm
+
+// Movement Parameters
+const float SPEED_CM_PER_SEC = 40.0 / 1.5;  // 26.67 cm/s at speed 180
+const int MOTOR_SPEED = 180;                // Fixed speed (0-255)
+
+// WiFi Configuration
+const char* ssid = "Infinix HOT 30i";
+const char* password = "nsitwifi";
+
+// WebSocket Server
+WebSocketsServer webSocket = WebSocketsServer(80);
+
+void setup() {
+  Serial.begin(115200);
+  // Test ESP32 WiFi Connection
+  /*if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Pinging google.com...");
+    if (Ping.ping("google.com")) {
+        Serial.println("Internet access OK!");
+    } else {
+        Serial.println("No internet access");
+    }
+  }*/
+  
+  // Set motor control pins as outputs
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  
+  // Start with motors stopped
+  stopMotors();
+  
+  // Connect to WiFi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  Serial.println("\nWiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+  
+  // Start WebSocket server
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+}
+
+void loop() {
+  webSocket.loop();
+}
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_TEXT:
+      Serial.printf("[%u] Received: %s\n", num, payload);
+      handleCommand(payload);
+      break;
+      
+    case WStype_DISCONNECTED:
+      Serial.printf("[%u] Disconnected!\n", num);
+      break;
+      
+    case WStype_CONNECTED:
+      {
+        IPAddress ip = webSocket.remoteIP(num);
+        Serial.printf("[%u] Connected from %d.%d.%d.%d\n", num, ip[0], ip[1], ip[2], ip[3]);
+        webSocket.sendTXT(num, "Connected to Robot");
+      }
+      break;
+  }
+}
+
+void handleCommand(uint8_t * payload) {
+  // Parse JSON command
+  DynamicJsonDocument doc(1024);
+  DeserializationError error = deserializeJson(doc, payload);
+  
+  if (error) {
+    Serial.print("JSON parse failed: ");
+    Serial.println(error.c_str());
+    webSocket.sendTXT(0, "ERROR: Invalid command format");
+    return;
+  }
+  
+  // Check if it's a compound command (array of arrays)
+  if (doc.is<JsonArray>() && doc[0].is<JsonArray>()) {
+    for (JsonArray cmd : doc.as<JsonArray>()) {
+      executeSingleCommand(cmd);
+    }
+  } 
+  // Single command (single array)
+  else if (doc.is<JsonArray>()) {
+    executeSingleCommand(doc.as<JsonArray>());
+  }
+  // Invalid format
+  else {
+    Serial.println("Invalid command format");
+    webSocket.sendTXT(0, "ERROR: Invalid command format");
+  }
+}
+
+void executeSingleCommand(JsonArray cmd) {
+  // Extract command elements
+  const char* intent = cmd[0];
+  const char* direction = cmd[1];
+  const char* value = cmd[2];
+  const char* unit = cmd[3];
+  
+  // Handle stop command immediately
+  if (strcmp(intent, "stop") == 0) {
+    stopMotors();
+    webSocket.sendTXT(0, "ACK: STOP executed");
+    return;
+  }
+  
+  // Handle scan command (NEW INTENT)
+  if (strcmp(intent, "scan") == 0) {
+    // Perform a 360° scan to the right
+    turn('r', 360);
+    webSocket.sendTXT(0, "ACK: SCAN executed");
+    return;
+  }
+  
+  // Validate command parameters for other intents
+  if (!direction || !value || !unit) {
+    Serial.println("Invalid command parameters");
+    webSocket.sendTXT(0, "ERROR: Missing parameters");
+    return;
+  }
+  
+  // Convert value to float
+  float numericValue = atof(value);
+  
+  // Execute movement commands
+  if (strcmp(intent, "move") == 0) {
+    char moveDir = 'f';
+    
+    if (strcmp(direction, "forward") == 0) moveDir = 'f';
+    else if (strcmp(direction, "backward") == 0) moveDir = 'b';
+    else {
+      Serial.println("Invalid direction for move");
+      webSocket.sendTXT(0, "ERROR: Invalid direction");
+      return;
+    }
+    
+    // Validate unit
+    if (strcmp(unit, "cm") != 0) {
+      Serial.println("Invalid unit for move");
+      webSocket.sendTXT(0, "ERROR: Invalid unit");
+      return;
+    }
+    
+    move(moveDir, numericValue);
+    webSocket.sendTXT(0, "ACK: MOVE executed");
+  } 
+  else if (strcmp(intent, "turn") == 0) {
+    char turnDir = 'l';
+    
+    if (strcmp(direction, "left") == 0) turnDir = 'l';
+    else if (strcmp(direction, "right") == 0) turnDir = 'r';
+    else {
+      Serial.println("Invalid direction for turn");
+      webSocket.sendTXT(0, "ERROR: Invalid direction");
+      return;
+    }
+    
+    // Validate unit
+    if (strcmp(unit, "degree") != 0) {
+      Serial.println("Invalid unit for turn");
+      webSocket.sendTXT(0, "ERROR: Invalid unit");
+      return;
+    }
+    
+    turn(turnDir, numericValue);
+    webSocket.sendTXT(0, "ACK: TURN executed");
+  }
+  else {
+    Serial.println("Unknown intent");
+    webSocket.sendTXT(0, "ERROR: Unknown intent");
+  }
+}
+
+void move(char direction, float distance) {
+  // Calculate required time in milliseconds
+  unsigned long duration_ms = (distance / SPEED_CM_PER_SEC) * 1000;
+  
+  // Stop both motors initially
+  stopMotors();
+  
+  if (direction == 'f' || direction == 'F') {
+    // Move forward
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+  
+    // Set motor speeds
+    analogWrite(ENA, MOTOR_SPEED);
+    analogWrite(ENB, MOTOR_SPEED);
+    
+    // Run for calculated duration
+    delay(duration_ms);
+    
+    // Stop motors
+    analogWrite(ENB, 0);
+    analogWrite(ENA, 0);
+  } 
+  else if (direction == 'b' || direction == 'B') {
+    // Move backward
+    digitalWrite(IN2, HIGH);
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN4, LOW);
+    digitalWrite(IN3, HIGH);
+  
+    // Set motor speeds
+    analogWrite(ENA, MOTOR_SPEED);
+    analogWrite(ENB, MOTOR_SPEED);
+    
+    // Run for calculated duration
+    delay(duration_ms);
+    
+    // Stop motors
+    analogWrite(ENB, 0);
+    analogWrite(ENA, 0);
+  }
+}
+
+void turn(char direction, float angle) {
+  // Calculate distance for single motor
+  float distance_cm = (angle * 2 * WHEEL_DISTANCE * PI) / 360.0;
+  
+  // Calculate required time in milliseconds
+  unsigned long duration_ms = (distance_cm / SPEED_CM_PER_SEC) * 1000;
+  
+  // Stop both motors initially
+  stopMotors();
+  
+  if (direction == 'r' || direction == 'R') {
+    // Turn right: Only left motor (Motor B) moves forward
+    digitalWrite(IN4, HIGH);
+    digitalWrite(IN3, LOW);
+    analogWrite(ENB, MOTOR_SPEED);
+    
+    // Run for calculated duration
+    delay(duration_ms);
+    
+    // Stop motor
+    analogWrite(ENB, 0);
+  } 
+  else if (direction == 'l' || direction == 'L') {
+    // Turn left: Only right motor (Motor A) moves forward
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+    analogWrite(ENA, MOTOR_SPEED);
+    
+    // Run for calculated duration
+    delay(duration_ms);
+    
+    // Stop motor
+    analogWrite(ENA, 0);
+  }
+}
+
+void stopMotors() {
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
